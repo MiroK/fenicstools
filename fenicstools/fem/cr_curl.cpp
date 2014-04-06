@@ -35,8 +35,11 @@ namespace dolfin
     // Get topological dimension so that we know what Facet is
     const Mesh mesh = *u.function_space()->mesh();
     std::size_t tdim = mesh.topology().dim(); 
-    // Get the info on length of u and gdim for the dot product
+    
+    // Gdim decides if we're building a vector(3d) or scalar (2d)
     std::size_t gdim = mesh.geometry().dim();
+    std::size_t len_curlu = (gdim == 3) ? gdim : 1;
+    int v_sign = (gdim == 3) ? 1 : -1;
 
     // Fill the values
     for(CellIterator cell(mesh); !cell.end(); ++cell)
@@ -56,7 +59,7 @@ namespace dolfin
         std::vector<dolfin::la_index>
         facets_dofs = CR1_dofmap->cell_dofs(cell->index());
        
-        std::vector<double> cell_integrals(3);
+        std::vector<double> cell_integrals(len_curlu);
         std::size_t local_facet_index = 0;
         for(FacetIterator facet(*cell); !facet.end(); ++facet)
         {
@@ -70,25 +73,25 @@ namespace dolfin
 
           // Flip the normal if it is not outer already
           Point facet_mp = facet->midpoint();
-          int sign = (facet_normal.dot(facet_mp - cell_mp) > 0) ? 1 : -1;
-          facet_normal *= sign;
+          int n_sign = (facet_normal.dot(facet_mp - cell_mp) > 0) ? 1 : -1;
+          facet_normal *= n_sign;
 
           // Dofs of CR on the facet, local order
           std::vector<std::size_t> facet_dofs; // u_x, u_y, u_z
           CR1_dofmap->tabulate_facet_dofs(facet_dofs, local_facet_index);
 
           // (n x u)_i*meas(facet)
-          for(std::size_t i = 0; i < gdim; i++)
+          for(std::size_t i = 0; i < len_curlu; i++)
           {
             double u0 = (*U)[facets_dofs[facet_dofs[(i + 1)%gdim]]];
             double u1 = (*U)[facets_dofs[facet_dofs[(i + 2)%gdim]]];
             double n0 = facet_normal[(i + 1)%gdim];
             double n1 = facet_normal[(i + 2)%gdim];
-            cell_integrals[i] += (-u0*n1 + u1*n0)*facet_measure;
+            cell_integrals[i] += v_sign*(-u0*n1 + u1*n0)*facet_measure;
           }
           local_facet_index += 1;
         }
-        for(std::size_t i = 0; i < gdim; i++)
+        for(std::size_t i = 0; i < len_curlu; i++)
         {
           double cell_integral = cell_integrals[i]/cell_volume;
           dolfin::la_index cell_dof = cell_dofs[i];
