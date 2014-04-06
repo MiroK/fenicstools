@@ -1,7 +1,7 @@
 __author__ = "Miroslav Kuchta <mirok@math.uio.no>"
 __date__ = "2014-04-05"
 __copyright__ = "Copyright (C) 2013 " + __author__
-__license__  = "GNU Lesser GPL version 3 or any later version"
+__license__ = "GNU Lesser GPL version 3 or any later version"
 
 import inspect
 from dolfin import TensorFunctionSpace, VectorFunctionSpace, FunctionSpace,\
