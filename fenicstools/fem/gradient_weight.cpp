@@ -47,7 +47,7 @@ namespace dolfin
     }
   }
   
-  void compute_DG0_to_CG_weight_matrix(GenericMatrix& A, Function& DG)
+  void compute_DG0_to_CG_weight_matrix(GenericMatrix& A, Function& DG, bool divide=true)
   {
     compute_weight(DG);
 
@@ -151,22 +151,24 @@ namespace dolfin
       std::transform(values.begin(), values.end(), values.begin(),
                      std::bind2nd(std::multiplies<double>(), 1./s));      
 
-      for (std::size_t i=0; i<values.size(); i++)
+      if(divide)
       {
-        double w;
-        std::size_t dof = columns[i];
-        if (dof < weight_range.first || dof >= weight_range.second)
+        for (std::size_t i=0; i<values.size(); i++)
         {
-          w = received_weights[dof];
+          double w;
+          std::size_t dof = columns[i];
+          if (dof < weight_range.first || dof >= weight_range.second)
+          {
+            w = received_weights[dof];
+          }
+          else
+          {
+            w = weight[dof];  
+          }        
+          values[i] = values[i]*w;
+  //        values[i] = values[i]*values[i];
         }
-        else
-        {
-          w = weight[dof];  
-        }        
-        values[i] = values[i]*w;
-//        values[i] = values[i]*values[i];
-        
-      }     
+      }
       
       allvalues.push_back(values);
       allcolumns.push_back(columns);
