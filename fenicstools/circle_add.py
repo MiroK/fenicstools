@@ -7,7 +7,7 @@ mesh = UnitSquareMesh(20, 20)
 comm = mesh.mpi_comm().tompi4py()
 
 nparticles = 200
-particles = 0.5*np.random.rand(nparticles, 2)
+particles = 1.2*np.random.rand(nparticles, 2)
 
 tree = mesh.bounding_box_tree()
 lim = mesh.topology().size_global(2)
@@ -32,10 +32,8 @@ next_rank = (world_rank + 1) % world_size
 prev_rank = (world_rank + world_size - 1) % world_size
 
 loop = 0
-while max(count_global) > 0:
-    if world_rank == 0: 
-        loop += 1
-        info('%d :%s' % (loop, count_global))
+while max(count_global) > 0 and loop < world_size:
+    loop += 1
 
     # Send to next
     comm.Send(np.array(not_found_local).flatten(), next_rank, world_rank)
@@ -60,6 +58,7 @@ while max(count_global) > 0:
 
 dist = comm.allgather(len(found))
 total_found = sum(dist)
+print total_found, nparticles*world_size
 assert total_found == nparticles*world_size
 
 if world_rank == 0:
