@@ -17,25 +17,28 @@ u = interpolate(Expression(("-2*sin(pi*x[1])*cos(pi*x[1])*pow(sin(pi*x[0]),2)",
 lp = LagrangianParticles(V)
 lp.add_particles(particle_positions)
 
-fig = plt.figure()
-lp.scatter(fig)
-fig.suptitle('Initial')
+# fig = plt.figure()
+# lp.scatter(fig)
+# fig.suptitle('Initial')
 
-if comm.Get_rank() == 0:
-    fig.show()
+#if comm.Get_rank() == 0:
+#    fig.show()
 
-plt.ion()
+#plt.ion()
 
 save = False
 
 dt = 0.01
-for step in range(500):
+t = Timer('LP')
+for step in range(20):
     lp.step(u, dt=dt)
 
-    lp.scatter(fig)
-    fig.suptitle('At step %d' % step)
-    fig.canvas.draw()
+    #lp.scatter(fig)
+    #fig.suptitle('At step %d' % step)
+    #fig.canvas.draw()
 
-    if save: plt.savefig('img%s.png' % str(step).zfill(4))
+    #if save: plt.savefig('img%s.png' % str(step).zfill(4))
 
-    fig.clf()
+    #fig.clf()
+dt = t.stop()
+info('Moved %s particles in %g' % (lp.total_number_of_particles(), dt))
