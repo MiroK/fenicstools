@@ -1,9 +1,32 @@
+from collections import defaultdict, namedtuple
 from itertools import count, ifilter
-from collections import defaultdict
 import dolfin as df
 import numpy as np
 
+def add_timer(f):
+    def f_timed(*args, **kwargs):
+        t = df.Timer()
+        ans = f(*args, **kwargs)
+        dt = t.stop()
+        info('\t%s took %g' % (f.func_name, dt))
+        return ans
+    return f_timed
 
+lg_count = namedtuple('Local_Global_count', ['lc', 'gc'])
+def plen(comm, stuff):
+    '''Local and global count of stuff.'''
+    lc = len(stuff)
+    gc = comm.allreduce(lc)
+    return lg_count(lc, gc)
+
+# IDEAs: 
+# 1) Is search accelerated by bounding boxes? E.g. don't allow particles that
+# left to enter the 'ring' search
+# 2) The neighb. patch could go acrross process so when c == -1 we would ship to
+# other rank also this cell (that particle left) and it could lookup part of
+# patch where to loop for [need small dt to be efficient so that search most
+# often terminates in the patch
+# 3) Figure out the CPU layout and only have CPU talk to its neighbors
 class CellWithParticles(df.Cell):
     '''
     Dolfin cell holding a set of particles which are keys in the
@@ -35,7 +58,7 @@ class LPCollection(object):
     Collection of Lagrangian particles. Particle data is stored in a dictionary 
     and cells which contain them hold reference to the data.
     '''
-    def __init__(self, V, property_layout=None):
+    def __init__(self, V, property_layout=None, debug=True):
         # The cell neighbors requires cell-cell connectivity which is here
         # defined as throught cell - vertex - cell connectivity
         mesh = V.mesh()
@@ -87,6 +110,46 @@ class LPCollection(object):
         self.prev_rank = (comm.rank - 1) % comm.size
         self.comm = comm
 
+        if debug:
+            self.__add_particles_local = add_timer(self.__add_particles_local)
+            self.__add_particles_global = add_timer(self.__add_particles_global)
+            self.__update = add_timer(self.__update)
+
+    # Most common in API ---
+
+    def step(self, u, dt, verbose=False):
+        'Move particles by forward Euler x += u*dt'
+        # Update positions of particles
+        for c in self.cells.itervalues():
+            vertex_coords, orientation = c.get_vertex_coordinates(), c.orientation()
+            # Restrict once per cell
+            u.restrict(self.coefficients, self.element, c, vertex_coords, c)
+            for p in c.particles:
+                x = self.get_x(p)
+                # Compute velocity at position x
+                self.element.evaluate_basis_all(self.basis_matrix, x, vertex_coords, orientation)
+                x[:] = x[:] + dt*np.dot(self.coefficients, self.basis_matrix)[:]
+        # Update cells/particles
+        self.__update(verbose)
+
+    def add_particles(self, particles, verbose=False):
+        '''Add new particles to collection.'''
+        # How many particles do we start and end up with
+        if verbose: start = plen(self.comm, particles).gc
+
+        # Figure out which particles cannot be added locally on CPU
+        not_found = self.__add_particles_local(particles)
+        # Send unfoung particles to other CPUs to see if can be added there
+        count = len(not_found)
+        count_global = self.comm.allgather(count)
+        not_found = self.__add_particles_global(count_global, not_found)
+
+        if verbose: 
+            missing = plen(self.comm, not_found).gc
+            info('Wanted to add %d particles. Found %d.' % (start, start-missing))
+
+    # Convenience ---
+
     def get_x(self, particle):
         '''Return position of particle.'''
         return self.particles[particle][:self.dim]
@@ -103,15 +166,11 @@ class LPCollection(object):
 
     def cell_count(self):
         '''Local and global cell count of cells in collection.'''
-        lc = len(self.cells)
-        gc = self.comm.allreduce(lc)
-        return (lc, gc)
+        return plen(self.comm, self.cells)
 
     def particle_count(self):
         '''Local and global particle count of particles in collection.'''
-        lc = len(self.particles)
-        gc = self.comm.allreduce(lc)
-        return (lc, gc)
+        return plen(self.comm, self.particles)
 
     def find_cell(self, x):
         '''Find cell which contains x on this CPU, -1 if not found.'''
@@ -119,31 +178,7 @@ class LPCollection(object):
         c = self.tree.compute_first_entity_collision(point)
         return c if c < self.lim else -1
 
-    def step(self, u, dt):
-        'Move particles by forward Euler x += u*dt'
-        # Update positions of particles
-        for c in self.cells.itervalues():
-            vertex_coords, orientation = c.get_vertex_coordinates(), c.orientation()
-            # Restrict once per cell
-            u.restrict(self.coefficients, self.element, c, vertex_coords, c)
-            for p in c.particles:
-                x = self.get_x(p)
-                # Compute velocity at position x
-                self.element.evaluate_basis_all(self.basis_matrix, x, vertex_coords, orientation)
-                x[:] = x[:] + dt*np.dot(self.coefficients, self.basis_matrix)[:]
-        # Update cells/particles
-        self.__update()
-
-    def add_particles(self, particles):
-        '''Add new particles to collection.'''
-        # Figure out which particles cannot be added locally on CPU
-        not_found = self.__add_particles_local(particles)
-        # Send unfoung particles to other CPUs to see if can be added there
-        count = len(not_found)
-        count_global = self.comm.allgather(count)
-        self.__add_particles_global(count_global, not_found)
-
-    # ---------
+    # Core ---
 
     def __add_particles_local(self, particles):
         '''Search CPU for cells that have particles.'''
@@ -187,14 +222,14 @@ class LPCollection(object):
             count = len(not_found)
             count_global = self.comm.allgather(count)
         self.comm.barrier()
-
         return not_found
 
-    def __update(self):
+    def __update(self, verbose=False):
         '''
         Update particle and cell dictionaries based on new position of
         particles.
         '''
+        if verbose: start = self.particle_count().gc
         cell_map = defaultdict(list)    # Collect new cells with particles
         empty_cells = []                # Cells to be removed from self.cells
         for c in self.cells.itervalues():
@@ -237,6 +272,10 @@ class LPCollection(object):
         # Finally remove these particles 
         for p in non_local_particles: self.particles.pop(p)
 
+        if verbose: 
+            stop = self.particle_count().gc
+            info('Before update %d, after update %d' % (start, stop))
+
 # ----------------------------------------------------------------------------
 
 if __name__ == '__main__':
@@ -277,14 +316,11 @@ if __name__ == '__main__':
     size = lpc.comm.size
 
     particles = 0.8*np.random.rand(nparticles/size, 2)
-    lpc.add_particles(particles)
+    lpc.add_particles(particles, verbose=True)
 
     t = Timer('LP')
-    for i in range(10): lpc.step(v, dt)
+    for i in range(10): lpc.step(v, dt, verbose=True)
     dt = t.stop()
 
     count = lpc.particle_count()
-    info('Stepped %d particles in %g s' % (count[1], dt))
-
-    
-
+    info('Stepped %d particles in %g s' % (count.gc, dt))
