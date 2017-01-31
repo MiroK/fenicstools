@@ -1,63 +1,55 @@
+from itertools import count, ifilter
 from collections import defaultdict
-from itertools import count
 import dolfin as df
 import numpy as np
 
 
 class CellWithParticles(df.Cell):
-    '''TODO'''
-    def __init__(self, lp_collection, cell_id, particle=None):
-        '''TODO'''
+    '''
+    Dolfin cell holding a set of particles which are keys in the
+    lp_collection dictionary.
+    '''
+    def __init__(self, lp_collection, cell_id):
         mesh = lp_collection.mesh
-
         df.Cell.__init__(self, mesh, cell_id)
-
+        # NOTE: the choice for set here is to allow for removing left particles
+        # by difference 
         self.particles = set([])
-        if particle is not None: self + particle
-
+        # Make cell aware of its neighbors
         tdim = lp_collection.dim
         neighbors = sum((vertex.entities(tdim).tolist() for vertex in df.vertices(self)), [])
         neighbors = set(neighbors) - set([cell_id])   # Remove self
         self.neighbors = map(lambda neighbor_index: df.Cell(mesh, neighbor_index), neighbors)
 
-    def __add__(self, particle): self.particles.add(particle)
+    def __add__(self, particle):
+        '''Add a particle.'''
+        self.particles.add(particle)
 
-    def __len__(self): return len(self.particles)
-
-    def __bool__(self): return len(self) > 0
+    def __len__(self):
+        '''Number of particles'''
+        return len(self.particles)
 
 
 class LPCollection(object):
-    '''TODO'''
-    def __init__(self, V, property_layout):
-        '''TODO'''
+    '''
+    Collection of Lagrangian particles. Particle data is stored in a dictionary 
+    and cells which contain them hold reference to the data.
+    '''
+    def __init__(self, V, property_layout=None):
+        # The cell neighbors requires cell-cell connectivity which is here
+        # defined as throught cell - vertex - cell connectivity
         mesh = V.mesh()
         self.dim = mesh.geometry().dim()
         assert self.dim == mesh.topology().dim()
         mesh.init(0, self.dim)
         self.mesh = mesh
 
+        # Locating particles in cells done by bbox collisions
         self.tree = mesh.bounding_box_tree()
         self.lim = mesh.topology().size_global(self.dim)
-
-        # NOTE: property layout here is the map which maps property name to
-        # length of a vector that represents property value
-        assert all(v > 0 for v in property_layout.values())
-        offsets = [0, self.mesh.geometry().dim()] + [property_layout[k] for k in property_layout]
-        self.psize = sum(offsets)
-        self.offsets = np.cumsum(offsets)
-        self.keys = ['x'] + property_layout.keys()
-
-        self.particles = {}
-        self.cells = {}
-        self.ticket = count()
-
-        comm = mesh.mpi_comm().tompi4py()
-        assert comm.size == 1 or comm.size % 2 == 0
-        self.next_rank = (comm.rank + 1) % comm.size
-        self.prev_rank = (comm.rank + comm.size - 1) % comm.size
-        self.comm = comm
-
+        
+        # Velocity evaluation is done by restriction the function on a cell. For
+        # this we prealocate data
         element = V.dolfin_element()
         
         num_tensor_entries = 1
@@ -65,170 +57,234 @@ class LPCollection(object):
 
         self.coefficients = np.zeros(element.space_dimension())
         self.basis_matrix = np.zeros((element.space_dimension(), num_tensor_entries))
-
         self.element = element
         self.num_tensor_entries = num_tensor_entries
 
+        # Particles and cells are stored in dicts and we refer to each by ints.
+        # For cell this is the cell index, particles get a ticket from their
+        # counter. # NOTE: When particle leaves CPU it is removed from the
+        # dictionary in turn particles.keys may develop 'holes'.
+        self.particles = {}
+        self.cells = {}
+        self.ticket = count()
 
-    def locate(self, x):
+        # Property layout here is the map which maps property name to
+        # length of a vector that represents property value. By default
+        # particles only store the position
+        if property_layout is None: property_layout = []
+        property_layout = [('x', self.dim)] + property_layout
+        props, sizes = map(list, zip(*property_layout))
+        assert all(v > 0 for v in sizes)
+        offsets = [0] + sizes
+        self.psize = sum(offsets)    # How much to store per particle
+        self.offsets = np.cumsum(offsets)
+        self.keys = props
+
+        # Finally the particles are send in circle  (prev) -> (this) --> (next)
+        comm = mesh.mpi_comm().tompi4py()
+        assert comm.size == 1 or comm.size % 2 == 0
+        self.next_rank = (comm.rank + 1) % comm.size
+        self.prev_rank = (comm.rank - 1) % comm.size
+        self.comm = comm
+
+    def get_x(self, particle):
+        '''Return position of particle.'''
+        return self.particles[particle][:self.dim]
+
+    def get_property(self, particle, prop):
+        '''Get property of particle.'''
+        i = self.keys.index(prop)
+        f, l = self.offsets[i], self.offsets[i+1]
+        select = lambda p: self.particles[p][f:l]
+
+        if isinstance(particle, int): return select(particle)
+
+        return map(select, particle)
+
+    def cell_count(self):
+        '''Local and global cell count of cells in collection.'''
+        lc = len(self.cells)
+        gc = self.comm.allreduce(lc)
+        return (lc, gc)
+
+    def particle_count(self):
+        '''Local and global particle count of particles in collection.'''
+        lc = len(self.particles)
+        gc = self.comm.allreduce(lc)
+        return (lc, gc)
+
+    def find_cell(self, x):
+        '''Find cell which contains x on this CPU, -1 if not found.'''
         point = df.Point(*x)
         c = self.tree.compute_first_entity_collision(point)
         return c if c < self.lim else -1
 
+    def step(self, u, dt):
+        'Move particles by forward Euler x += u*dt'
+        # Update positions of particles
+        for c in self.cells.itervalues():
+            vertex_coords, orientation = c.get_vertex_coordinates(), c.orientation()
+            # Restrict once per cell
+            u.restrict(self.coefficients, self.element, c, vertex_coords, c)
+            for p in c.particles:
+                x = self.get_x(p)
+                # Compute velocity at position x
+                self.element.evaluate_basis_all(self.basis_matrix, x, vertex_coords, orientation)
+                x[:] = x[:] + dt*np.dot(self.coefficients, self.basis_matrix)[:]
+        # Update cells/particles
+        self.__update()
+
+    def add_particles(self, particles):
+        '''Add new particles to collection.'''
+        # Figure out which particles cannot be added locally on CPU
+        not_found = self.__add_particles_local(particles)
+        # Send unfoung particles to other CPUs to see if can be added there
+        count = len(not_found)
+        count_global = self.comm.allgather(count)
+        self.__add_particles_global(count_global, not_found)
+
+    # ---------
+
     def __add_particles_local(self, particles):
+        '''Search CPU for cells that have particles.'''
         not_found = []
         for p in particles:
             x = p[:self.dim]
 
-            c = self.locate(x)
+            c = self.find_cell(x)
             if c > -1: 
-                key = next(self.ticket)
-                self.particles[key] = p
-                if c not in self.cells:
-                    self.cells[c] = CellWithParticles(self, c, key)
-                self.cells[c] + key
-                key += 1
+                # A found particle gets a new unique tag
+                tag = next(self.ticket)
+                self.particles[tag] = p
+                if c not in self.cells: self.cells[c] = CellWithParticles(self, c)
+                # and is added to the cell
+                self.cells[c] + tag
             else:
                 not_found.append(p)
         return not_found
-
-    def add_particles(self, particles):
-        not_found = self.__add_particles_local(particles)
-        count = len(not_found)
-        count_global = self.comm.allgather(count)
-
-        self.__add_particles_global(count_global, not_found)
-
     
     def __add_particles_global(self, count_global, not_found):
+        '''Search other CPUs for cells that have particles.'''
         loop = 1
+        # NOTE: if all the particles were in the computational domain then the
+        # loop should terminate (at most) once the particles not found on some
+        # process travel the full circle. Whathever is not found once the loop
+        # is over is outside domain.
         while max(count_global) > 0 and loop < self.comm.size:
             loop += 1
             received = np.zeros(count_global[self.prev_rank]*self.psize, dtype=float)
+            sent = np.array(not_found).flatten()
+            # Send to next and recv from previous. NOTE: module prevents deadlock
             if self.comm.rank % 2:
-                # Send to next
-                self.comm.Send(np.array(not_found).flatten(), self.next_rank, self.comm.rank)
-                # Receive particles from previous
+                self.comm.Send(sent, self.next_rank, self.comm.rank)
                 self.comm.Recv(received, self.prev_rank, self.prev_rank)
             else:
-                # Receive particles from previous
                 self.comm.Recv(received, self.prev_rank, self.prev_rank)
-                # Send to next
-                self.comm.Send(np.array(not_found).flatten(), self.next_rank, self.comm.rank)
-            # Work with received
+                self.comm.Send(sent, self.next_rank, self.comm.rank)
+            # Find cells on this CPU for received particles
             received = received.reshape((-1, self.psize))
             not_found = self.__add_particles_local(received)
             count = len(not_found)
             count_global = self.comm.allgather(count)
-            # info('%d %s' % (loop, count_global))
         self.comm.barrier()
 
         return not_found
 
-
-    def step(self, u, dt):
-        'Move particles by forward Euler x += u*dt'
-        for cwp in self.cells.itervalues():
-            vertex_coordinates, orientation = cwp.get_vertex_coordinates(), cwp.orientation()
-            # Restrict once per cell
-            u.restrict(self.coefficients,
-                       self.element,
-                       cwp,
-                       vertex_coordinates,
-                       cwp)
-            for particle in cwp.particles:
-                x = self.particles[particle][:self.dim]
-                # Compute velocity at position x
-                self.element.evaluate_basis_all(self.basis_matrix,
-                                                x,
-                                                vertex_coordinates, 
-                                                orientation)
-                x[:] = x[:] + dt*np.dot(self.coefficients, self.basis_matrix)[:]
-        self.relocate()
-
-
-    def relocate(self):
-        cell_map = defaultdict(list)
-        empty_cells = []
-        for cwp in self.cells.itervalues():
-
+    def __update(self):
+        '''
+        Update particle and cell dictionaries based on new position of
+        particles.
+        '''
+        cell_map = defaultdict(list)    # Collect new cells with particles
+        empty_cells = []                # Cells to be removed from self.cells
+        for c in self.cells.itervalues():
             left = []
-            for particle in cwp.particles:
-                x = self.particles[particle][:self.dim]
+            for p in c.particles:
+                x = self.get_x(p)
 
                 point = df.Point(*x)
+                found = c.contains(point)
                 # Search only if particle moved outside original cell
-                if not cwp.contains(point):
-                    left.append(particle)
-                    # FIXME
-                    found = False
-                    # Check neighbor cells
-                    for neighbor in cwp.neighbors:
-                        if neighbor.contains(point):
+                if not found:
+                    left.append(p)
+                    # Check first neighbor cells
+                    for neighbor in c.neighbors:
+                        found = neighbor.contains(point)
+                        if found:
                             new_cell = neighbor.index()
-                            found = True
                             break
-                    # Do a completely new search if not found by now
-                    if not found: new_cell = self.locate(x)
+                    # Do a completely new search if not found by now, can be -1
+                    if not found: new_cell = self.find_cell(x)
                     # Record to map
-                    cell_map[new_cell].append(particle)
-            cwp.particles.difference_update(set(left))
-            if not cwp.particles: empty_cells.append(cwp.index())
-        for cell in empty_cells: self.cells.pop(cell)
+                    cell_map[new_cell].append(p)
+            # Remove from cell the particles that left it
+            c.particles.difference_update(set(left))
+            if len(c.particles) == 0: empty_cells.append(c.index())
+        # Remove cells with no particles
+        for c in empty_cells: self.cells.pop(c)
 
         # Add locally found particles
-        local_cells = cell_map.keys()
-        if -1 in local_cells:
-            local_cells.remove(-1)
-            non_local = cell_map[-1]
-        else:
-            non_local = []
-
+        local_cells = ifilter(lambda x: x != -1, cell_map.iterkeys())
         for c in local_cells:
-            if c not in self.cells:
-                self.cells[c] = CellWithParticles(self, c)
+            if c not in self.cells: self.cells[c] = CellWithParticles(self, c)
             for p in cell_map[c]: self.cells[c] + p
 
-        particles = [self.particles[i] for i in non_local]
-        count_global = self.comm.allgather(len(particles))
-        not_found = self.__add_particles_global(count_global, particles)
-        for i in non_local: self.particles.pop(i)
-
-        lost = self.comm.allreduce(len(not_found))
-        # info('%d' % lost)
+        # Ship particles not found on this CPU to others
+        non_local_particles = cell_map.get(-1, [])
+        count_global = self.comm.allgather(len(non_local_particles))
+        not_found = self.__add_particles_global(count_global,
+                                                [self.particles[i] for i in non_local_particles])
+        # Finally remove these particles 
+        for p in non_local_particles: self.particles.pop(p)
 
 # ----------------------------------------------------------------------------
 
 if __name__ == '__main__':
     from dolfin import UnitSquareMesh, VectorFunctionSpace, info, Timer, interpolate
     from dolfin import Expression
+    from mpi4py import MPI as pyMPI
     import sys
 
     mesh = UnitSquareMesh(20, 20)
     V = VectorFunctionSpace(mesh, 'CG', 1)
     v = interpolate(Expression(('-(x[1]-0.5)', 'x[0]-0.5'), degree=1), V)
 
-    property_layout = {}#{'q': 1}
-    lpc = LPCollection(V, property_layout)
+    nparticles = int(sys.argv[1])
+    dt = 0.001
+
+    # TEST1: Check correctness
+    if False:
+        property_layout = [('x1', 2)]
+        lpc = LPCollection(V, property_layout)
+
+        particles_x0 = 0.8*np.random.rand(nparticles, 2)
+
+        x, y = particles_x0[:, 0], particles_x0[:, 1]
+        particles_x1 = particles_x0 + dt*np.c_[-(y-0.5), (x-0.5)]
+
+        particles = np.c_[particles_x0, particles_x1]
+
+        lpc.add_particles(particles)
+        lpc.step(v, dt)
+
+        loc_error = max(np.linalg.norm(lpc.get_property(p, 'x') - lpc.get_property(p, 'x1'))
+                        for p in lpc.particles)
+        glob_error = lpc.comm.allreduce(loc_error, op=pyMPI.MAX)
+        info('%g %g' % (loc_error, glob_error))
+
+    # Timing
+    lpc = LPCollection(V)
     size = lpc.comm.size
 
-    nparticles = int(sys.argv[1])
-    
-    t = Timer('foo')
-    for i in range(100):
-        particles_x = 0.8*np.random.rand(nparticles/size, 2)
-        particles_q = np.random.rand(nparticles/size)
-        particles = np.c_[particles_x, particles_q]
-        lpc.add_particles(particles_x)
+    particles = 0.8*np.random.rand(nparticles/size, 2)
+    lpc.add_particles(particles)
+
+    t = Timer('LP')
+    for i in range(10): lpc.step(v, dt)
     dt = t.stop()
-    # info('%g' % dt)
 
-    #print lpc.particles
-    for i in range(20):
-        print i
-        lpc.step(v, 0.001)
+    count = lpc.particle_count()
+    info('Stepped %d particles in %g s' % (count[1], dt))
 
-    # print lpc.particles
-    # lpc.step(v, 0.01)
+    
 
-    # info('%s' % lpc.particles.keys())
