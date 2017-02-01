@@ -27,6 +27,8 @@ def plen(comm, stuff):
 # patch where to loop for [need small dt to be efficient so that search most
 # often terminates in the patch
 # 3) Figure out the CPU layout and only have CPU talk to its neighbors
+# 4) Gather all the particles [dict by CPU]
+# 5) Storing into format which paraview can read (with selected data)
 class CellWithParticles(df.Cell):
     '''
     Dolfin cell holding a set of particles which are keys in the
@@ -58,7 +60,7 @@ class LPCollection(object):
     Collection of Lagrangian particles. Particle data is stored in a dictionary 
     and cells which contain them hold reference to the data.
     '''
-    def __init__(self, V, property_layout=None, debug=True):
+    def __init__(self, V, property_layout=None, debug=False):
         # The cell neighbors requires cell-cell connectivity which is here
         # defined as throught cell - vertex - cell connectivity
         mesh = V.mesh()
@@ -312,7 +314,7 @@ if __name__ == '__main__':
         info('%g %g' % (loc_error, glob_error))
 
     # Timing
-    lpc = LPCollection(V)
+    lpc = LPCollection(V, debug=False)
     size = lpc.comm.size
 
     particles = 0.8*np.random.rand(nparticles/size, 2)
