@@ -1,5 +1,5 @@
 from collections import defaultdict, namedtuple
-from itertools import count, ifilter
+from itertools import count, ifilter, imap
 import dolfin as df
 import numpy as np
 
@@ -149,6 +149,22 @@ class LPCollection(object):
         if verbose: 
             missing = plen(self.comm, not_found).gc
             info('Wanted to add %d particles. Found %d.' % (start, start-missing))
+
+    def store(self, name, prop=''):
+        '''Save current particle position's (and scalar data) in XDMF file'''
+        assert name.endswith('.xdmf')
+        f = df.XDMFFile(self.mesh.mpi_comm(), name)
+        if prop:
+            i = self.keys.index(prop)
+            is_scalar = (self.offsets[i+1] - self.offsets[i]) == 1
+            assert is_scalar
+
+            f.write(map(df.Point, imap(self.get_x, self.particles.iterkeys())),
+                    np.array([self.get_property(p, prop) for p in self.particles.iterkeys()]),
+                    df.XDMFFile.Encoding_HDF5)
+        else:
+            f.write(map(df.Point, imap(self.get_x, self.particles.iterkeys())),
+                    df.XDMFFile.Encoding_HDF5)
 
     # Convenience ---
 
@@ -314,14 +330,18 @@ if __name__ == '__main__':
         info('%g %g' % (loc_error, glob_error))
 
     # Timing
-    lpc = LPCollection(V, debug=False)
+    property_layout = [('T', 1)]
+    lpc = LPCollection(V, property_layout, debug=False)
     size = lpc.comm.size
 
-    particles = 0.8*np.random.rand(nparticles/size, 2)
+    particles = np.c_[0.8*np.random.rand(nparticles/size, 2),
+                      np.random.rand(nparticles/size)]
     lpc.add_particles(particles, verbose=True)
 
     t = Timer('LP')
-    for i in range(10): lpc.step(v, dt, verbose=True)
+    for i in range(10): 
+        lpc.step(v, dt, verbose=True)
+        lpc.store('test_%d.xdmf' % i, 'T')
     dt = t.stop()
 
     count = lpc.particle_count()
