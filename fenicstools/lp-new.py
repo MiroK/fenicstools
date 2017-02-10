@@ -1,5 +1,5 @@
 from collections import defaultdict, namedtuple
-from itertools import count, ifilter, imap
+from itertools import count, ifilter, imap, izip
 import dolfin as df
 import numpy as np
 
@@ -294,11 +294,28 @@ class LPCollection(object):
             stop = self.particle_count().gc
             info('Before update %d, after update %d' % (start, stop))
 
+
+def subdomain_count(lpc, subdomains, markers):
+    '''
+    Given cell function(subdomains) return local and global count of
+    particles found in regions marked as markers.
+    '''
+    assert isinstance(subdomains, df.CellFunctionSizet)
+
+    local_counts = [sum(imap(len, ifilter(lambda cell: subdomains[cell] == marker,
+                                          lpc.cells.itervalues())))
+                    for marker in markers]
+    local_counts = np.array(local_counts, dtype=int)
+    global_counts = np.zeros_like(local_counts)
+    lpc.comm.Allreduce(local_counts, global_counts)    
+
+    return tuple(local_counts), tuple(global_counts)
+
 # ----------------------------------------------------------------------------
 
 if __name__ == '__main__':
     from dolfin import UnitSquareMesh, VectorFunctionSpace, info, Timer, interpolate
-    from dolfin import Expression
+    from dolfin import Expression, CellFunction, cells
     from mpi4py import MPI as pyMPI
     import sys
 
@@ -338,10 +355,22 @@ if __name__ == '__main__':
                       np.random.rand(nparticles/size)]
     lpc.add_particles(particles, verbose=True)
 
+    from random import choice
+    markers = [1, 2, 3, 4]
+    subdomains = CellFunction('size_t', mesh, 0)
+    for cell in cells(mesh): subdomains[cell] = choice(markers) 
+
+    if lpc.comm.rank == 0: 
+        out = open('test_counts.txt', 'w')
+        temp = '%d\t'*len(markers) + '\n'
+
     t = Timer('LP')
     for i in range(10): 
         lpc.step(v, dt, verbose=True)
         lpc.store('test_%d.xdmf' % i, 'T')
+
+        _, counts = subdomain_count(lpc, subdomains, markers)
+        if lpc.comm.rank == 0: out.write(temp % counts)
     dt = t.stop()
 
     count = lpc.particle_count()
