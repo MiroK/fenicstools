@@ -1,7 +1,9 @@
+from itertools import count, ifilter, imap, izip, chain
 from collections import defaultdict, namedtuple
-from itertools import count, ifilter, imap, izip
+from math import sqrt
 import dolfin as df
 import numpy as np
+import random
 
 def add_timer(f):
     def f_timed(*args, **kwargs):
@@ -311,13 +313,75 @@ def subdomain_count(lpc, subdomains, markers):
 
     return tuple(local_counts), tuple(global_counts)
 
+
+def subdomain_seed(lpc, nparticles, subdomains=None, markers=None):
+    '''Seed particles in marked subdomain.'''
+    # We shall chose the points by selecting a random cell (allowed if it has a
+    # proper tag) and inside the cells we make a random point
+    mesh = lpc.mesh
+    if subdomains is not None and markers is not None:
+        allowed = set(c.index()
+                      for c in chain(*[df.SubsetIterator(subdomains, m) for m in markers]))
+        allowed = list(allowed)
+        random_cell = lambda: random.choice(allowed)
+    else:
+        # Without markers all cells are allowed
+        ncells = mesh.topology().size(mesh.topology().dim())
+
+        random_cell = lambda: random.randint(0, ncells-1)
+   
+    # Random point inside triangle/tet
+    # http://math.stackexchange.com/questions/18686/uniform-random-point-in-triangle
+    dim = mesh.geometry().dim()
+    if dim == 2:
+        def random_point(A, B, C):
+            '''See Milikan's answer.'''
+            r1 = sqrt(random.random())
+            r2 = random.random()
+            return (1-r1)*A + r1*(1-r2)*B + r2*r1*C
+    else:
+        assert dim == 3
+        def random_point(A, B, C, D):
+            '''See the thread for generalization'''
+            c = np.random.rand(4)
+            c = -np.log(c)
+            c /= sum(c)
+            return A*c[0] + B*c[1] + C*c[2] + D*c[3]
+
+    count = 0
+    particles = []
+    while count < nparticles:
+        cell = random_cell()
+        x = df.Cell(mesh, cell).get_vertex_coordinates().reshape((-1, dim))
+        p = random_point(*x)
+        particles.append(p) 
+        count += 1
+    return lpc.add_particles(particles)
+
 # ----------------------------------------------------------------------------
 
 if __name__ == '__main__':
     from dolfin import UnitSquareMesh, VectorFunctionSpace, info, Timer, interpolate
-    from dolfin import Expression, CellFunction, cells
+    from dolfin import Expression, CellFunction, cells, UnitCubeMesh, CompiledSubDomain
     from mpi4py import MPI as pyMPI
     import sys
+
+    # TEST0: subdomain seeding
+    mesh = UnitCubeMesh(10, 10, 10)
+    V = VectorFunctionSpace(mesh, 'CG', 1)
+    v = interpolate(Expression(('-(x[1]-0.5)', 'x[0]-0.5', '0'), degree=1), V)
+
+    subdomains = CellFunction('size_t', mesh, 0)
+    CompiledSubDomain('x[2] > 0.2').mark(subdomains, 1)
+
+    lpc = LPCollection(V)
+    subdomain_seed(lpc, 1000, subdomains, [1])
+    _, counts = subdomain_count(lpc, subdomains, markers=[0, 1])
+    assert counts == (0, 1000*lpc.comm.size)
+
+    lpc.store('test.xdmf')
+    df.File('test_mesh.pvd') << mesh
+    exit()
 
     mesh = UnitSquareMesh(20, 20)
     V = VectorFunctionSpace(mesh, 'CG', 1)
