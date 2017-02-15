@@ -1,6 +1,7 @@
 from itertools import ifilter, imap, izip, chain
 from itertools import count as C_O_U_N_T
 from collections import defaultdict, namedtuple
+from operator import or_
 from math import sqrt
 import dolfin as df
 import numpy as np
@@ -31,7 +32,6 @@ def plen(comm, stuff):
 # often terminates in the patch
 # 3) Figure out the CPU layout and only have CPU talk to its neighbors
 # 4) Gather all the particles [dict by CPU]
-# 5) Storing into format which paraview can read (with selected data)
 class CellWithParticles(df.Cell):
     '''
     Dolfin cell holding a set of particles which are keys in the
@@ -340,23 +340,11 @@ def subdomain_count(lpc, subdomains, markers):
 
     return tuple(local_counts), tuple(global_counts)
 
-
-def subdomain_seed(lpc, nparticles, subdomains=None, markers=None):
+def subdomain_seed(lpc, nparticles, subdomains=None, markers=None, use_tags=False):
     '''Seed particles in marked subdomain.'''
     # We shall chose the points by selecting a random cell (allowed if it has a
     # proper tag) and inside the cells we make a random point
     mesh = lpc.mesh
-    if subdomains is not None and markers is not None:
-        allowed = set(c.index()
-                      for c in chain(*[df.SubsetIterator(subdomains, m) for m in markers]))
-        allowed = list(allowed)
-        random_cell = lambda: random.choice(allowed)
-    else:
-        # Without markers all cells are allowed
-        ncells = mesh.topology().size(mesh.topology().dim())
-
-        random_cell = lambda: random.randint(0, ncells-1)
-   
     # Random point inside triangle/tet
     # http://math.stackexchange.com/questions/18686/uniform-random-point-in-triangle
     dim = mesh.geometry().dim()
@@ -375,14 +363,53 @@ def subdomain_seed(lpc, nparticles, subdomains=None, markers=None):
             c /= sum(c)
             return A*c[0] + B*c[1] + C*c[2] + D*c[3]
 
+    # Selecting random cell
+    if subdomains is not None and markers is not None:
+        if use_tags:
+            # In this case we would like to label the seeded particles by markers. 
+            # A special layout is required
+            assert set(lpc.keys) <= set(['x', 'tags'])
+            # NOTE: It is not optimal but seems mathematically more correct to seed
+            # the union of regions and then label according to which random cell was
+            # chosen
+            marked_cells = [set(c.index() for c in df.SubsetIterator(subdomains, m))
+                            for m in markers]
+            allowed = list(reduce(or_, marked_cells))
+            
+            def find_marker(c):
+                for m, region in zip(markers, marked_cells):
+                    if c in region: return m
+                assert False
+        else:
+            marked_cells = set(c.index() for c in chain(*[df.SubsetIterator(subdomains, m) 
+                                                          for m in markers]))
+            allowed = list(marked_cells)
+        random_cell = lambda: random.choice(allowed)
+    else:
+        assert not use_tags
+        # Without markers all cells are allowed
+        ncells = mesh.topology().size(mesh.topology().dim())
+
+        random_cell = lambda: random.randint(0, ncells-1)
+   
     count = 0
     particles = []
-    while count < nparticles:
-        cell = random_cell()
-        x = df.Cell(mesh, cell).get_vertex_coordinates().reshape((-1, dim))
-        p = random_point(*x)
-        particles.append(p) 
-        count += 1
+    # Swith here only once
+    if not use_tags:
+        while count < nparticles:
+            cell = random_cell()
+            x = df.Cell(mesh, cell).get_vertex_coordinates().reshape((-1, dim))
+            p = random_point(*x)
+            particles.append(p) 
+            count += 1
+    else:
+        while count < nparticles:
+            cell = random_cell()
+            marker = find_marker(cell) 
+            x = df.Cell(mesh, cell).get_vertex_coordinates().reshape((-1, dim))
+            p = np.r_[random_point(*x), marker]
+            particles.append(p) 
+            count += 1
     return lpc.add_particles(particles)
 
 # ----------------------------------------------------------------------------
@@ -400,14 +427,15 @@ if __name__ == '__main__':
     v = interpolate(Expression(('-(x[1]-0.5)', 'x[0]-0.5', '0'), degree=1), V)
 
     subdomains = CellFunction('size_t', mesh, 0)
-    CompiledSubDomain('x[2] > 0.2').mark(subdomains, 1)
+    CompiledSubDomain('x[2] > 0.6').mark(subdomains, 1)
+    CompiledSubDomain('x[2] < 0.4').mark(subdomains, 2)
 
-    lpc = LPCollection(V)
-    subdomain_seed(lpc, 1000, subdomains, [1])
-    _, counts = subdomain_count(lpc, subdomains, markers=[0, 1])
-    assert counts == (0, 1000*lpc.comm.size)
+    lpc = LPCollection(V, property_layout=[('tags', 1)])
+    subdomain_seed(lpc, 10000, subdomains, [0, 1, 2], True)
+    _, counts = subdomain_count(lpc, subdomains, markers=[0, 1, 2])
+    # assert counts == (1000*lpc.comm.size, 0, 0), counts
 
-    lpc.store('test.xdmf')
+    lpc.store('test.xdmf', 'tags')
     df.File('test_mesh.pvd') << mesh
 
     mesh = UnitSquareMesh(20, 20)
